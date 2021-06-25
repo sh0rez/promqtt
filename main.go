@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,19 +21,29 @@ type Config struct {
 	ClientID string
 
 	Listen string
+
+	Verbose bool
 }
 
 func DefaultConfig() Config {
-	return Config{
+	c := Config{
 		ClientID: "promqtt",
 		Listen:   ":9337",
+		Verbose:  false,
 	}
+
+	if hostname, err := os.Hostname(); err == nil {
+		c.ClientID += "@" + hostname
+	}
+
+	return c
 }
 
 func main() {
 	cfg := DefaultConfig()
 	pflag.StringVar(&cfg.Listen, "listen", cfg.Listen, "address to listen on")
 	pflag.StringVar(&cfg.ClientID, "client-id", cfg.ClientID, "mqtt client id")
+	pflag.BoolVarP(&cfg.Verbose, "verbose", "v", cfg.Verbose, "verbose logging")
 	pflag.Usage = func() {
 		fmt.Printf("Usage: %s <broker> [flags]\n", os.Args[0])
 		pflag.PrintDefaults()
@@ -46,7 +57,12 @@ func main() {
 
 	cfg.Broker = pflag.Arg(0)
 
+	if cfg.Verbose {
+		mqtt.ERROR = log.New(os.Stdout, "", 0)
+	}
+
 	c := mqtt.NewClient(mqtt.NewClientOptions().
+		SetAutoReconnect(false).
 		AddBroker(cfg.Broker).
 		SetClientID(cfg.ClientID),
 	)
@@ -54,8 +70,12 @@ func main() {
 		log.Fatalf("failed to connect to broker: %s", t.Error())
 	}
 	log.Printf("connected to broker at '%s' as '%s'", cfg.Broker, cfg.ClientID)
+	defer c.Disconnect(0)
 
-	r := NewRelay(c)
+	r, err := NewRelay(c)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	http.Handle("/mqtt", r)
 	http.Handle("/metrics", promhttp.Handler())
@@ -66,18 +86,21 @@ func main() {
 	}
 }
 
-func NewRelay(m mqtt.Client) *Relay {
-	return &Relay{
-		mqtt:    m,
-		targets: make(map[string]*Target),
+func NewRelay(m mqtt.Client) (*Relay, error) {
+	r := &Relay{
+		data: make(map[string]string),
 	}
+
+	if tok := m.Subscribe("#", 0, r.HandleMQTT); tok.Wait() && tok.Error() != nil {
+		return nil, tok.Error()
+	}
+
+	return r, nil
 }
 
 type Relay struct {
-	mqtt mqtt.Client
-
-	targets map[string]*Target
-	mu      sync.RWMutex
+	mu   sync.RWMutex
+	data map[string]string
 }
 
 func (rl *Relay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -86,82 +109,78 @@ func (rl *Relay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "must pass topic", http.StatusBadRequest)
 		return
 	}
-
-	if _, has := rl.targets[topic]; !has {
-		if err := rl.addTarget(topic); err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
+	topicExp, err := regexp.Compile(topic)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	reg := prometheus.NewRegistry()
-	t := rl.targets[topic]
-	for topic, val := range t.data {
-		opts := prometheus.GaugeOpts{
-			Name:        metricName(topic),
-			ConstLabels: prometheus.Labels{"topic": topic},
-		}
-		g := prometheus.NewGauge(opts)
-		g.Set(val)
-
-		if err := reg.Register(g); err != nil {
-			log.Println(err)
-		}
+	regex := r.URL.Query().Get("regex")
+	if regex == "" {
+		regex = `(.*)`
 	}
 
+	regexExp, err := regexp.Compile(regex)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	log.Println(topic, regex)
+
+	reg := rl.metrics(topicExp, regexExp)
 	promhttp.HandlerFor(reg, promhttp.HandlerOpts{}).ServeHTTP(w, r)
 }
 
-func (rl *Relay) HandleMQTT(c mqtt.Client, m mqtt.Message) {
-	val, err := strconv.ParseFloat(string(m.Payload()), 64)
-	if err != nil {
-		log.Printf("failed to parse '%s' from '%s' as float: %s", m.Payload(), m.Topic(), err)
-		return
-	}
+func (rl *Relay) metrics(topicExp, matcher *regexp.Regexp) *prometheus.Registry {
+	reg := prometheus.NewRegistry()
 
-	// add received value to all targets that match this topic
-	for name, t := range rl.targets {
-		if !mqttMatches(name, m.Topic()) {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+
+	for topic, data := range rl.data {
+		fmt.Println(topic)
+
+		if !topicExp.MatchString(topic) {
 			continue
 		}
 
-		t.data[m.Topic()] = val
+		matches := matcher.FindStringSubmatch(data)
+
+		for i, name := range matcher.SubexpNames() {
+			if i == 0 {
+				continue
+			}
+
+			value, err := strconv.ParseFloat(matches[i], 64)
+			if err != nil {
+				log.Printf("failed to parse '%s' from '%s' as float64", data, topic)
+				continue
+			}
+
+			g := prometheus.NewGauge(prometheus.GaugeOpts{
+				Name:        metricName(topic) + name,
+				ConstLabels: prometheus.Labels{"topic": topic},
+			})
+			g.Set(value)
+
+			if err := reg.Register(g); err != nil {
+				log.Println(err)
+			}
+		}
 	}
+
+	return reg
 }
 
-// addTarget subscribes the relay to the given topic and sets up the required
-// internal data structures
-func (rl *Relay) addTarget(topic string) error {
-	tok := rl.mqtt.Subscribe(topic, 0, rl.HandleMQTT)
-	if tok.Wait() && tok.Error() != nil {
-		return fmt.Errorf("failed subscribint to '%s': %w", topic, tok.Error())
-	}
-	log.Printf("subscribed to '%s'", topic)
-
-	rl.targets[topic] = &Target{
-		data: make(map[string]float64),
-	}
-	return nil
-}
-
-// mqttMatches determines whether topic is matched by the wildcard
-func mqttMatches(wildcard string, topic string) bool {
-	return true
+func (rl *Relay) HandleMQTT(c mqtt.Client, m mqtt.Message) {
+	rl.mu.Lock()
+	rl.data[m.Topic()] = string(m.Payload())
+	rl.mu.Unlock()
 }
 
 // metricName sanitizes a string so that it becomes a valid Prometheus metric
 // name by replacing all illegal characters with underscores (_)
 func metricName(s string) string {
 	return strings.ReplaceAll(s, "/", "_")
-}
-
-// Target represents any topic we are subscribed to. Because these are likely
-// wildcards, we may receive data for several distinct topics, thus data is a
-// map
-type Target struct {
-	data map[string]float64
-	mu   sync.RWMutex
 }
