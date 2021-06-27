@@ -62,9 +62,9 @@ func main() {
 	}
 
 	c := mqtt.NewClient(mqtt.NewClientOptions().
-		SetAutoReconnect(false).
 		AddBroker(cfg.Broker).
-		SetClientID(cfg.ClientID),
+		SetClientID(cfg.ClientID).
+		SetConnectionLostHandler(func(c mqtt.Client, e error) { log.Printf("connection lost: %s", e.Error()) }),
 	)
 	if t := c.Connect(); t.Wait() && t.Error() != nil {
 		log.Fatalf("failed to connect to broker: %s", t.Error())
@@ -126,8 +126,6 @@ func (rl *Relay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println(topic, regex)
-
 	reg := rl.metrics(topicExp, regexExp)
 	promhttp.HandlerFor(reg, promhttp.HandlerOpts{}).ServeHTTP(w, r)
 }
@@ -139,13 +137,14 @@ func (rl *Relay) metrics(topicExp, matcher *regexp.Regexp) *prometheus.Registry 
 	defer rl.mu.RUnlock()
 
 	for topic, data := range rl.data {
-		fmt.Println(topic)
-
 		if !topicExp.MatchString(topic) {
 			continue
 		}
 
 		matches := matcher.FindStringSubmatch(data)
+		if len(matches) == 0 {
+			continue
+		}
 
 		for i, name := range matcher.SubexpNames() {
 			if i == 0 {
