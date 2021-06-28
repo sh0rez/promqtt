@@ -57,22 +57,16 @@ func main() {
 
 	cfg.Broker = pflag.Arg(0)
 
+	mqtt.ERROR = log.New(os.Stdout, "", log.Flags())
 	if cfg.Verbose {
-		mqtt.ERROR = log.New(os.Stdout, "", 0)
+		mqtt.DEBUG = log.New(os.Stdout, "debug:", log.Flags())
 	}
 
-	c := mqtt.NewClient(mqtt.NewClientOptions().
+	opts := mqtt.NewClientOptions().
 		AddBroker(cfg.Broker).
-		SetClientID(cfg.ClientID).
-		SetConnectionLostHandler(func(c mqtt.Client, e error) { log.Printf("connection lost: %s", e.Error()) }),
-	)
-	if t := c.Connect(); t.Wait() && t.Error() != nil {
-		log.Fatalf("failed to connect to broker: %s", t.Error())
-	}
-	log.Printf("connected to broker at '%s' as '%s'", cfg.Broker, cfg.ClientID)
-	defer c.Disconnect(0)
+		SetClientID(cfg.ClientID)
 
-	r, err := NewRelay(c)
+	r, err := NewRelay(opts)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -86,12 +80,25 @@ func main() {
 	}
 }
 
-func NewRelay(m mqtt.Client) (*Relay, error) {
+func NewRelay(mqttOpts *mqtt.ClientOptions) (*Relay, error) {
 	r := &Relay{
 		data: make(map[string]string),
 	}
 
-	if tok := m.Subscribe("#", 0, r.HandleMQTT); tok.Wait() && tok.Error() != nil {
+	mqttOpts.SetConnectionLostHandler(func(c mqtt.Client, e error) {
+		log.Printf("connection lost: %s", e.Error())
+	})
+
+	mqttOpts.SetOnConnectHandler(func(c mqtt.Client) {
+		tok := c.Subscribe("#", 0, r.HandleMQTT)
+
+		if tok.Wait() && tok.Error() != nil {
+			log.Fatalf("failed to subscribe to all topics: %s", tok.Error())
+		}
+		log.Println("subscribed to '#'")
+	})
+
+	if tok := mqtt.NewClient(mqttOpts).Connect(); tok.Wait() && tok.Error() != nil {
 		return nil, tok.Error()
 	}
 
