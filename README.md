@@ -108,7 +108,7 @@ This gives us the following `scrape_configs` entry:
         - tele/.+/SENSOR # regular expression matching some MQTT topic
   params:
     regex:
-      - '"Power":(?P<_power>[\d.]+).*"Voltage":(?P<_voltage>[\d.]+).*"Current":(?P<_current>[\d.]+)',
+      - '"Power":(?P<_power>[\d.]+).*"Voltage":(?P<_voltage>[\d.]+).*"Current":(?P<_current>[\d.]+)'
   relabel_configs:
     # copy above address (tele/...) into the "topic" URL parameter
     - source_labels: [__address__]
@@ -147,7 +147,7 @@ But again, this can be fixed by adding some `metric_relabel_configs`. Continuing
   # ...
   metric_relabel_configs:
     # rename series to tasmota_<field> style
-    - source_label: [__name__]
+    - source_labels: [__name__]
       target_label: __name__
       regex: tele.+_SENSOR_(.+)
       replacement: tasmota_$1
