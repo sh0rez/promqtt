@@ -108,7 +108,8 @@ This gives us the following `scrape_configs` entry:
         - tele/.+/SENSOR # regular expression matching some MQTT topic
   params:
     regex:
-      - '"Power":(?P<_power>[\d.]+).*"Voltage":(?P<_voltage>[\d.]+).*"Current":(?P<_current>[\d.]+)'
+      - '"Total": *(?P<_total_kWh>[\d.]+).*"Power": *(?P<_power_watt>[\d.]+).*"ApparentPower": *(?P<_apparent_power_VA>[\d.]+).*"ReactivePower": *(?P<_reactive_power_VAr>[\d.]+).*"Factor": *(?P<_factor>[\d.]+).*"Voltage": *(?P<_voltage>[\d.]+).*"Current": *(?P<_current>[\d.]+)'
+
   relabel_configs:
     # copy above address (tele/...) into the "topic" URL parameter
     - source_labels: [__address__]
